@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfcsv"
+version = "1.4.0"
+description = "Universal PDF to CSV Extractor with intelligent column detection and bank statement support"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "stexz01", email = "stexz01@users.noreply.github.com"}
+]
+keywords = [
+    "pdf", "csv", "extractor", "bank-statement", "tabular-data", "pdf-parser",
+    "pdf-to-csv", "pdf-to-excel", "pdf-to-json", "pdf-extractor", "pdf-table",
+    "data-extraction", "table-extraction", "document-parser", "cli-tool",
+    "python-pdf", "pdfplumber", "excel-export", "json-export", "markdown-table",
+    "bank-statement-parser", "financial-data", "transaction-extractor"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Text Processing",
+    "Topic :: Utilities",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "pdfplumber>=0.9.0",
+    "openpyxl>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black",
+    "flake8",
+]
+
+[project.urls]
+Homepage = "https://github.com/stexz01/pdfcsv"
+Repository = "https://github.com/stexz01/pdfcsv"
+Issues = "https://github.com/stexz01/pdfcsv/issues"
+
+[project.scripts]
+pdfcsv = "pdfcsv:main"
+pdf-raw = "pdf_raw:main"
+
+[tool.setuptools]
+py-modules = ["pdfcsv", "pdf_raw", "banking_keywords"]
