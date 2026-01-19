@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/logo.svg" alt="PDFcsv Logo" width="120">
-</p>
-
 <h1 align="center">PDFcsv</h1>
 <h3 align="center">Universal PDF to CSV Extractor</h3>
 
@@ -36,7 +32,7 @@ pdfcsv your_file.pdf
 ## Demo
 
 <p align="center">
-  <img src="assets/demo.gif" alt="PDFcsv Demo" width="700">
+  <img src="assets/pdfcsv_demo.gif" alt="PDFcsv Demo" width="700">
 </p>
 
 <p align="center">
@@ -275,8 +271,7 @@ pdfcsv/
 ├── LICENSE               # MIT License
 ├── README.md             # Documentation
 └── assets/
-    ├── logo.svg          # Project logo
-    └── demo.gif          # CLI demo
+    └── pdfcsv_demo.gif          # CLI demo 
 ```
 
 ---
