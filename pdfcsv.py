@@ -155,8 +155,8 @@ def open_pdf(pdf_path: str):
     Open a PDF file with automatic handling of encrypted documents.
 
     Attempts to open normally first, then tries empty password for PDFs
-    with owner-only restrictions. Provides helpful error message if
-    the PDF requires a password.
+    with owner-only restrictions. If password-protected, prompts user
+    for password with retry support.
 
     Args:
         pdf_path: Path to the PDF file
@@ -165,8 +165,10 @@ def open_pdf(pdf_path: str):
         pdfplumber.PDF object
 
     Raises:
-        SystemExit: If PDF is password-protected
+        SystemExit: If user cancels password entry
     """
+    c = Colors
+
     try:
         return pdfplumber.open(pdf_path)
     except Exception as e1:
@@ -177,13 +179,34 @@ def open_pdf(pdf_path: str):
             # Check if it's an encryption error (check str, repr, and type)
             error_info = f"{str(e1).lower()} {repr(e1).lower()} {str(type(e1))}"
             if "password" in error_info or "encrypt" in error_info:
-                print(f"\n{Colors.RED}{Colors.BOLD}ERROR:{Colors.RESET} PDF is password-protected")
-                print(f"{Colors.YELLOW}File:{Colors.RESET} {pdf_path}")
-                print(f"\n{Colors.CYAN}To use this PDF, you can:{Colors.RESET}")
-                print(f"  1. Get the password from the PDF owner")
-                print(f"  2. Try removing protection with: {Colors.WHITE}qpdf --decrypt input.pdf output.pdf{Colors.RESET}")
-                print(f"  3. Use online PDF unlock tools (if allowed by document owner)\n")
-                sys.exit(1)
+                print(f"\n{c.YELLOW}{c.BOLD}PDF is password-protected{c.RESET}")
+                print(f"{c.DIM}File: {pdf_path}{c.RESET}")
+                print(f"{c.DIM}Enter password or 'q' to quit{c.RESET}\n")
+
+                # Password retry loop
+                attempts = 0
+                while True:
+                    try:
+                        attempts += 1
+                        password = input(f"{c.CYAN}Password:{c.RESET} ")
+
+                        # Check for quit
+                        if password.lower() == 'q':
+                            print(f"{c.YELLOW}Cancelled{c.RESET}\n")
+                            sys.exit(0)
+
+                        # Try opening with password
+                        try:
+                            pdf = pdfplumber.open(pdf_path, password=password)
+                            print(f"{c.GREEN}{c.BOLD}✓{c.RESET} Password accepted\n")
+                            return pdf
+                        except Exception:
+                            print(f"{c.RED}✗ Wrong password{c.RESET} {c.DIM}(attempt {attempts}){c.RESET}")
+                            continue
+
+                    except (KeyboardInterrupt, EOFError):
+                        print(f"\n{c.YELLOW}Cancelled{c.RESET}\n")
+                        sys.exit(0)
             raise e1
 
 
@@ -1071,6 +1094,10 @@ def print_help():
 
     {c.DIM}# Export as Markdown table{c.RESET}
     pdfcsv statement.pdf --format markdown
+
+{c.BOLD}PASSWORD-PROTECTED PDFs{c.RESET}
+    If a PDF is password-protected, you'll be prompted to enter
+    the password. Enter 'q' or press Ctrl+C to cancel.
 
 {c.BOLD}HOW IT WORKS{c.RESET}
     1. Extracts characters with pixel positions from PDF
