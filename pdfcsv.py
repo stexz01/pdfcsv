@@ -29,7 +29,7 @@ License: MIT
 Repository: https://github.com/stexz01/pdfcsv
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 __author__ = "@stexz01"
 
 # Global silent mode flag
@@ -39,10 +39,14 @@ SILENT_MODE = False
 # IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import pdfplumber
 import csv
+import json
+import os
+import re
 import sys
 from collections import Counter
+
+import pdfplumber
 
 # Optional: Banking keywords for statement detection (graceful fallback if missing)
 try:
@@ -50,6 +54,14 @@ try:
     BANKING_DETECTION_AVAILABLE = True
 except ImportError:
     BANKING_DETECTION_AVAILABLE = False
+
+# Terminal raw input (Unix only, graceful fallback for Windows)
+try:
+    import tty
+    import termios
+    _TERMINAL_RAW_INPUT = True
+except ImportError:
+    _TERMINAL_RAW_INPUT = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -210,6 +222,212 @@ def open_pdf(pdf_path: str):
             raise e1
 
 
+def _extract_tables(pdf) -> list:
+    """
+    Extract data from an open PDF using pdfplumber's built-in table detection.
+
+    Works for PDFs with structured tables (gridlines/borders).
+    Handles multi-line cells by joining text within each cell.
+
+    Args:
+        pdf: An open pdfplumber.PDF object
+
+    Returns:
+        List of rows (each row is a list of strings), or empty list if no tables found.
+    """
+    all_rows = []
+    for page in pdf.pages:
+        tables = page.extract_tables()
+        for table in tables:
+            for row in table:
+                cleaned = []
+                for cell in row:
+                    if cell:
+                        text = re.sub(r'\s+', ' ', cell.replace('\n', ' ').strip())
+                        cleaned.append(text)
+                    else:
+                        cleaned.append('')
+                all_rows.append(cleaned)
+    return all_rows
+
+
+def clean_table_rows(rows: list, min_filled: int = 2) -> list:
+    """
+    Clean extracted table rows:
+    - Remove fully empty rows
+    - Remove rows with too few meaningful values (page-break header remnants)
+
+    Args:
+        rows: Raw table rows
+        min_filled: Minimum non-empty, non-dash cells to keep a row
+
+    Returns:
+        Cleaned list of rows
+    """
+    if not rows:
+        return []
+
+    cleaned = []
+    for row in rows:
+        meaningful = sum(
+            1 for cell in row
+            if cell and cell.strip() and cell.strip() != '-'
+        )
+        if meaningful >= min_filled:
+            cleaned.append(row)
+    return cleaned
+
+
+def _table_has_concatenated_cells(rows: list) -> bool:
+    """
+    Detect if table rows contain concatenated multi-record data.
+
+    Some PDFs (e.g. HDFC statements) pack multiple transactions into a single
+    table cell. This produces rows where date/amount fields contain multiple
+    space-separated values, which is not useful for CSV extraction.
+
+    Returns True if cells appear to contain concatenated records.
+    """
+    if len(rows) < 2:
+        return False
+
+    # Check first few data rows (skip possible header)
+    data_rows = rows[1:min(6, len(rows))]
+    if not data_rows:
+        data_rows = rows[:min(5, len(rows))]
+
+    for row in data_rows:
+        for cell in row:
+            if not cell or len(cell) < 20:
+                continue
+            # Multiple date patterns in a single cell = concatenated records
+            if len(re.findall(r'\d{2}/\d{2}/\d{2,4}', cell)) > 1:
+                return True
+            if len(re.findall(r'\d{1,2}\s+\w{3}\s+\d{2,4}', cell)) > 1:
+                return True
+
+    return False
+
+
+def _warn_broken_headers(raw_rows: list, cleaned_rows: list):
+    """
+    Detect and warn if column headers are missing from table extraction.
+
+    Some PDFs (e.g. SBI statements) render header text as vector graphics
+    (tiny filled rectangles) instead of actual text characters. This makes
+    them invisible to any text-based PDF extraction library.
+
+    Checks raw table rows for rows that were cleaned away (mostly empty cells)
+    which likely represent broken/unextractable header rows.
+    """
+    if not raw_rows or not cleaned_rows:
+        return
+
+    # Find the dominant column count in cleaned data
+    col_counts = Counter(len(r) for r in cleaned_rows)
+    target_cols = col_counts.most_common(1)[0][0]
+
+    # Check raw rows that were removed by cleaning — they might be broken headers
+    cleaned_set = {tuple(r) for r in cleaned_rows}
+    for row in raw_rows:
+        if tuple(row) in cleaned_set or len(row) != target_cols:
+            continue
+
+        # Row was removed and has the right column count — check if it's a broken header
+        empty_count = sum(1 for cell in row if not cell or not cell.strip())
+        if empty_count > len(row) // 2:
+            # More than half the cells are empty — broken header
+            filled = [cell.strip() for cell in row if cell and cell.strip()]
+            filled_str = ', '.join(filled) if filled else 'none'
+            print_warning(
+                f"Column headers not extractable (rendered as vector graphics in PDF)"
+            )
+            print_info(
+                f"{Colors.DIM}Only partial header recovered: [{filled_str}]{Colors.RESET}"
+            )
+            return
+
+
+def table_rows_to_lines(rows: list) -> list:
+    """
+    Convert table-extracted rows to the lines format used by gap-based extraction.
+
+    Uses dummy x_positions since table extraction doesn't provide pixel positions.
+    """
+    return [
+        {
+            'col_count': len(row),
+            'columns': row,
+            'x_positions': list(range(len(row)))
+        }
+        for row in rows
+    ]
+
+
+def _extract_gaps(pdf, gap_threshold: int = 5) -> list:
+    """
+    Internal: gap-based column extraction from an open pdfplumber PDF.
+
+    Groups characters by Y position, detects column breaks where gaps
+    between characters exceed threshold.
+    """
+    all_lines = []
+
+    for page in pdf.pages:
+        chars = page.chars
+        if not chars:
+            continue
+
+        # Group characters by Y position (lines)
+        lines_by_y = {}
+        for c in chars:
+            y = round(c['top'])
+            if y not in lines_by_y:
+                lines_by_y[y] = []
+            lines_by_y[y].append(c)
+
+        # Process each line
+        for y in sorted(lines_by_y.keys()):
+            row_chars = sorted(lines_by_y[y], key=lambda c: c['x0'])
+
+            # Build columns by detecting gaps
+            columns = []
+            x_positions = []
+            current_col = []
+            col_start_x = None
+
+            for i, char in enumerate(row_chars):
+                if i > 0:
+                    gap = char['x0'] - row_chars[i-1]['x1']
+                    if gap > gap_threshold:
+                        col_text = ''.join(c['text'] for c in current_col)
+                        if col_text.strip():
+                            columns.append(col_text.strip())
+                            x_positions.append(col_start_x)
+                        current_col = []
+                        col_start_x = None
+
+                if col_start_x is None:
+                    col_start_x = char['x0']
+                current_col.append(char)
+
+            # Don't forget last column
+            if current_col:
+                col_text = ''.join(c['text'] for c in current_col)
+                if col_text.strip():
+                    columns.append(col_text.strip())
+                    x_positions.append(col_start_x)
+
+            if columns:
+                all_lines.append({
+                    'col_count': len(columns),
+                    'columns': columns,
+                    'x_positions': x_positions
+                })
+
+    return all_lines
+
+
 def extract_lines_with_gaps(pdf_path: str, gap_threshold: int = 5) -> list:
     """
     Extract text lines from PDF using gap-based column detection.
@@ -230,62 +448,8 @@ def extract_lines_with_gaps(pdf_path: str, gap_threshold: int = 5) -> list:
             - columns: List of text values for each column
             - x_positions: List of X coordinates for each column start
     """
-    all_lines = []
-
     with open_pdf(pdf_path) as pdf:
-        for page in pdf.pages:
-            chars = page.chars
-            if not chars:
-                continue
-
-            # Group characters by Y position (lines)
-            lines_by_y = {}
-            for c in chars:
-                y = round(c['top'])
-                if y not in lines_by_y:
-                    lines_by_y[y] = []
-                lines_by_y[y].append(c)
-
-            # Process each line
-            for y in sorted(lines_by_y.keys()):
-                row_chars = sorted(lines_by_y[y], key=lambda c: c['x0'])
-
-                # Build columns by detecting gaps
-                columns = []
-                x_positions = []  # Store x_start for each column
-                current_col = []
-                col_start_x = None
-
-                for i, char in enumerate(row_chars):
-                    if i > 0:
-                        gap = char['x0'] - row_chars[i-1]['x1']
-                        if gap > gap_threshold:
-                            col_text = ''.join(c['text'] for c in current_col)
-                            if col_text.strip():
-                                columns.append(col_text.strip())
-                                x_positions.append(col_start_x)
-                            current_col = []
-                            col_start_x = None
-
-                    if col_start_x is None:
-                        col_start_x = char['x0']
-                    current_col.append(char)
-
-                # Don't forget last column
-                if current_col:
-                    col_text = ''.join(c['text'] for c in current_col)
-                    if col_text.strip():
-                        columns.append(col_text.strip())
-                        x_positions.append(col_start_x)
-
-                if columns:
-                    all_lines.append({
-                        'col_count': len(columns),
-                        'columns': columns,
-                        'x_positions': x_positions
-                    })
-
-    return all_lines
+        return _extract_gaps(pdf, gap_threshold)
 
 
 def find_header_row(lines: list) -> dict:
@@ -348,7 +512,6 @@ def keyword_matches(col: str, keywords: set) -> bool:
     Returns:
         True if any keyword matches
     """
-    import re
     col_lower = col.lower().strip()
 
     for kw in keywords:
@@ -613,9 +776,6 @@ def get_key():
     Returns:
         'UP', 'DOWN', 'ENTER', 'QUIT', 'ESC', or the character pressed
     """
-    import tty
-    import termios
-
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
@@ -964,7 +1124,6 @@ def save_tsv(rows: list, output_path: str):
 
 def save_json(rows: list, output_path: str):
     """Save rows to JSON format (array of arrays)"""
-    import json
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, indent=2, ensure_ascii=False)
     return output_path
@@ -972,7 +1131,6 @@ def save_json(rows: list, output_path: str):
 
 def save_jsonl(rows: list, output_path: str):
     """Save rows to JSON Lines format (one JSON object per line)"""
-    import json
     with open(output_path, 'w', encoding='utf-8') as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + '\n')
@@ -1176,31 +1334,48 @@ def main():
         banner()
 
     # Validate input file
-    import os
     if not os.path.exists(pdf_path):
         print_error(f"File not found: {pdf_path}")
         sys.exit(1)
 
-    # Step 1: Extract
+    # Step 1: Extract (try table extraction first, fall back to gap-based)
     print_step(1, f"Reading {c.WHITE}{c.BOLD}{pdf_path}{c.RESET}")
-    print_info(f"Gap threshold: {gap_threshold}px")
 
-    lines = extract_lines_with_gaps(pdf_path, gap_threshold)
-    print_success(f"Extracted {c.WHITE}{len(lines)}{c.RESET} lines")
+    is_table_mode = False
+    with open_pdf(pdf_path) as pdf:
+        # Try structured table extraction first (handles multi-line cells)
+        raw_table_rows = _extract_tables(pdf)
+        table_rows = clean_table_rows(raw_table_rows)
+
+        if table_rows and len(table_rows) >= 3 and not _table_has_concatenated_cells(table_rows):
+            lines = table_rows_to_lines(table_rows)
+            is_table_mode = True
+            print_success(f"Structured tables detected ({c.WHITE}{len(lines)}{c.RESET} rows)")
+
+            # Warn if column headers were unextractable (vector-drawn text)
+            _warn_broken_headers(raw_table_rows, table_rows)
+        else:
+            # Fallback: gap-based character extraction
+            print_info(f"Gap threshold: {gap_threshold}px")
+            lines = _extract_gaps(pdf, gap_threshold)
+            print_success(f"Extracted {c.WHITE}{len(lines)}{c.RESET} lines")
 
     # Check if this is a bank statement and find header early (for preview)
     bank_info = check_bank_statement(lines)
     header_row = None
     if bank_info['is_bank']:
-        print_warning(f"{c.YELLOW}Bank statement detected{c.RESET}")
-        print_info(f"{c.DIM}Empty debit/credit columns may not appear in output{c.RESET}")
-        if bank_info['debit_found']:
-            print_info(f"{c.DIM}Debit keywords found: {', '.join(bank_info['debit_found'][:3])}{c.RESET}")
-        if bank_info['credit_found']:
-            print_info(f"{c.DIM}Credit keywords found: {', '.join(bank_info['credit_found'][:3])}{c.RESET}")
+        if is_table_mode:
+            print_info(f"Bank statement detected (table extraction handles column alignment)")
+        else:
+            print_warning(f"{c.YELLOW}Bank statement detected{c.RESET}")
+            print_info(f"{c.DIM}Empty debit/credit columns may not appear in output{c.RESET}")
+            if bank_info['debit_found']:
+                print_info(f"{c.DIM}Debit keywords found: {', '.join(bank_info['debit_found'][:3])}{c.RESET}")
+            if bank_info['credit_found']:
+                print_info(f"{c.DIM}Credit keywords found: {', '.join(bank_info['credit_found'][:3])}{c.RESET}")
 
-        # Find header row for gap-filling preview
-        header_row = find_header_row(lines)
+            # Find header row for gap-filling preview
+            header_row = find_header_row(lines)
 
     # Step 2: Analyze (optional)
     if analyze_mode:
@@ -1230,8 +1405,8 @@ def main():
         winner = find_winning_column_count(lines)
         print_step(step_num, f"Auto-detected {c.WHITE}{winner}{c.RESET} columns as target")
 
-    # Apply gap-filling for bank statements (header_row already found above)
-    if bank_info['is_bank'] and header_row:
+    # Apply gap-filling for bank statements (only for gap-based extraction)
+    if not is_table_mode and bank_info['is_bank'] and header_row:
         debit_idx, credit_idx = find_debit_credit_column_indices(header_row)
         header_col_count = len(header_row['columns'])
 
