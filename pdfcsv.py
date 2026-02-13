@@ -687,6 +687,46 @@ def fill_empty_columns(lines: list, header: dict, target_col_count: int) -> list
     return filled_rows
 
 
+_DATE_RE = re.compile(
+    r'^\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}$'
+    r'|^\d{1,2}\s+\w{3}\s+\d{2,4}$'
+    r'|^\d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2}$'
+)
+
+
+def filter_non_date_rows(data_rows: list) -> tuple:
+    """
+    Filter out rows whose first column is not a date, when the data
+    appears to be date-indexed (e.g. bank statements, invoices).
+
+    Only activates when >50% of rows already start with a recognisable
+    date pattern, so non-date PDFs are unaffected.
+
+    Returns:
+        Tuple of (filtered_rows, count_removed)
+    """
+    if not data_rows or len(data_rows) < 3:
+        return data_rows, 0
+
+    date_count = sum(
+        1 for row in data_rows
+        if row and _DATE_RE.match(str(row[0]).strip())
+    )
+    date_ratio = date_count / len(data_rows)
+
+    if date_ratio < 0.5:
+        return data_rows, 0
+
+    filtered = []
+    for row in data_rows:
+        first_col = str(row[0]).strip() if row else ''
+        if _DATE_RE.match(first_col):
+            filtered.append(row)
+
+    removed = len(data_rows) - len(filtered)
+    return filtered, removed
+
+
 def find_winning_column_count(lines: list, min_columns: int = 2) -> int:
     """Find the most common column count (ignoring lines with < min_columns)"""
     counts = [line['col_count'] for line in lines if line['col_count'] >= min_columns]
@@ -1437,6 +1477,9 @@ def main():
         print_info(f"Try {c.CYAN}--analyze{c.RESET} to see column distribution")
         sys.exit(1)
 
+    # Filter out non-date rows when data is date-indexed
+    data_rows, date_filtered = filter_non_date_rows(data_rows)
+
     # Deduplicate rows (remove repeated headers, etc.)
     data_rows, rows_removed = deduplicate_rows(data_rows)
 
@@ -1445,6 +1488,8 @@ def main():
 
     # Build status message
     dedup_info = []
+    if date_filtered > 0:
+        dedup_info.append(f"{date_filtered} non-date rows")
     if rows_removed > 0:
         dedup_info.append(f"{rows_removed} duplicate rows")
     if cols_removed > 0:
